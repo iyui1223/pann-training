@@ -1,0 +1,49 @@
+# ── PANN training configuration ─────────────────────────────────────────────
+# Loaded by Source/M04_train_model/train.py
+# Branch: level-blocking — block-wise training with overlap stitching
+
+# Architecture: multi-scale 1D convolution with bottleneck
+n_levels: null            # null = use all levels in file
+level_start: 40           # skip stratospheric levels 0-39 (keep troposphere only)
+hidden_dim: 16            # channel count after 1x1 merge in ConvBranch
+conv_channels: 16         # explicit conv channel count (= hidden_dim here)
+bottleneck_dim: 10        # vertical-mode bottleneck channels
+architecture: conv1d
+dropout: 0.0
+
+# Level-blocking: split column into overlapping blocks trained independently
+block_size: 4             # levels per block
+block_overlap: 2          # shared levels between adjacent blocks (stride = size - overlap)
+
+# Training
+learning_rate: 1.0e-3
+batch_size: 64
+epochs: 39
+patience: 20
+weight_decay: 1.0e-5
+
+# Shapley branch reweighting: soft-weight branches by importance after warmup
+branch_dropout:
+  warmup_epochs: 10       # train normally for this many epochs first
+  reweight_interval: 15    # recompute Shapley weights every N epochs after warmup
+
+# Data
+n_folds: 4
+random_seed: 42
+
+# Target: Gaussian-modulated Q-only bias (non-linear, height-dependent)
+target:
+  mode: simple_gaussian_q
+  simple_gaussian_q:
+    conv_scale: 1.1
+    conv_center_hpa: 250     # lowered from 150 hPa (safer from stratospheric noise)
+    conv_sigma_levels: 3
+    cloud_scale: 0.9
+    cloud_center_hpa: 500
+    cloud_sigma_levels: 5
+
+# Loss weighting: "pressure" = p/p_sfc per level; "uniform" = plain MSE
+level_weight: pressure
+
+# Device ('cuda' or 'cpu')
+device: cpu

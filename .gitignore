@@ -1,0 +1,27 @@
+# Data (large NetCDF files — not version-controlled)
+data/*.nc
+data/*.h5
+
+# Model outputs
+output/models/
+output/hidden_activations/
+output/figs/
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
