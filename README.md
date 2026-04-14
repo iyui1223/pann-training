@@ -43,8 +43,8 @@ Download it from one of:
 
 | Source | Link |
 |--------|------|
-| Google Drive | *TODO: paste link here* |
-| Hugging Face | *TODO: paste link here* |
+| Google Drive | https://drive.google.com/file/d/1YFR89UxUAXQSG_lgTjBr7_JQpvBNq2Ro/view?usp=sharing |
+| Hugging Face | to be uploaded |
 
 After downloading, place it at `data/training_dataset_partitioned.nc`.
 
@@ -148,9 +148,3 @@ Install via `poetry install` (uses `pyproject.toml`) or `pip install -r requirem
 
 MIT
 
-## Citation
-
-If you use this code, please cite:
-
-> Ichikawa, Y. (2026). Process-Additive Neural Network for physics-partitioned
-> SCM bias correction. *In preparation.*
