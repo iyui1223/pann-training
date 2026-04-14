@@ -13,11 +13,12 @@ per branch and per vertical level.
 
 ```bash
 # 1. Clone this repo
-git clone <repo-url> pann-training
+git clone https://github.com/iyui1223/pann-training.git pann-training
 cd pann-training
 
-# 2. Install dependencies
-pip install -r requirements.txt      # or use the Poetry pyproject.toml from the parent project
+# 2. Install dependencies (pick one)
+poetry install                       # if you use Poetry
+pip install -r requirements.txt      # or plain pip
 
 # 3. Download the training dataset (see below) and place it at:
 #      data/training_dataset_partitioned.nc
@@ -69,6 +70,7 @@ See `config/config.yaml` → `target.mode` to switch between:
 ```
 pann-training/
 ├── README.md
+├── pyproject.toml            # Poetry dependency spec
 ├── requirements.txt
 ├── config/
 │   └── config.yaml          # architecture + training hyperparameters
@@ -138,9 +140,9 @@ python src/extract_hidden.py \
 
 ## Dependencies
 
-Core requirements: Python 3.11+, PyTorch, NumPy, xarray, matplotlib, PyYAML.
+Core requirements: Python 3.10+, PyTorch, NumPy, xarray, matplotlib, PyYAML.
 
-See `requirements.txt` for pinned versions.
+Install via `poetry install` (uses `pyproject.toml`) or `pip install -r requirements.txt`.
 
 ## License
 
