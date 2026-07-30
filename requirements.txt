@@ -5,3 +5,6 @@ netCDF4
 matplotlib
 PyYAML
 scipy
+scikit-learn
+# Optional, for experiments/dominance_synthetic_test.py only:
+# dominance-analysis>=1.1.9

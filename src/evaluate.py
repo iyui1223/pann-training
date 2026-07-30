@@ -113,7 +113,8 @@ def _load_model_from_checkpoint(ckpt, cfg, n_levels, device):
     if branch_weights:
         model.set_branch_weights(branch_weights)
         wstr = ", ".join(f"{n}={w:.4f}" for n, w in branch_weights.items())
-        print(f"    Branch weights applied: {wstr}")
+        method = ckpt.get("weight_method", "?")
+        print(f"    Branch weights applied [{method}]: {wstr}")
     model.to(device)
     return model, fold_cfg
 

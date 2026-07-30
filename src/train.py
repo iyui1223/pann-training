@@ -12,7 +12,9 @@ Usage (from shell script or directly):
 """
 
 import argparse
+import itertools
 import time
+from math import factorial
 from pathlib import Path
 
 import numpy as np
@@ -110,8 +112,177 @@ def _branch_variance_reweight(model, val_loader, device):
     return weights, log
 
 
+def _make_loss_fn(level_weights, device):
+    """Build the per-level-weighted MSE loss (plain MSE when no weights)."""
+    if level_weights is not None:
+        w = level_weights.to(device)
+
+        def loss_fn(pred, target):
+            return (w * (pred - target) ** 2).mean()
+
+        return loss_fn
+
+    _mse = torch.nn.MSELoss()
+
+    def loss_fn(pred, target):
+        return _mse(pred, target)
+
+    return loss_fn
+
+
+def _mean_val_r2(model, val_loader, device, n_levels, n_output_vars):
+    """Mean per-level R2 of the (possibly masked) model on the validation set.
+
+    Computed in normalised space; R2 is invariant to the per-output affine
+    scaling applied by the scaler, so it matches physical-space R2.  Levels
+    with ~zero target variance are ignored via ``nanmean``.
+    """
+    model.eval()
+    preds, targets = [], []
+    with torch.no_grad():
+        for batch in val_loader:
+            *xb, y = batch
+            xb = [t.to(device) for t in xb]
+            preds.append(model(*xb).cpu().numpy())
+            targets.append(y.numpy())
+    pred = np.concatenate(preds)
+    tgt = np.concatenate(targets)
+    pred_2d = pred.reshape(pred.shape[0], n_output_vars, n_levels)
+    tgt_2d = tgt.reshape(tgt.shape[0], n_output_vars, n_levels)
+    ss_res = np.sum((tgt_2d - pred_2d) ** 2, axis=0)
+    ss_tot = np.sum((tgt_2d - tgt_2d.mean(axis=0, keepdims=True)) ** 2, axis=0)
+    r2 = np.where(ss_tot > 1e-20, 1.0 - ss_res / ss_tot, np.nan)
+    return float(np.nanmean(r2))
+
+
+def _subset_r2(subset, build_pann, data, loss_fn, device, cfg,
+               n_levels, n_output_vars, cache):
+    """Train a fresh PANN restricted to ``subset`` of branches; return val R2.
+
+    Memoised by ``frozenset(subset)``.  The empty subset scores 0.  Masked
+    branches receive no gradient (``PANN.forward`` skips them), so this trains
+    a genuine subset-only model.
+    """
+    key = frozenset(subset)
+    if key in cache:
+        return cache[key]
+    if not key:
+        cache[key] = 0.0
+        return 0.0
+
+    probe_epochs = int((cfg.get("branch_dropout") or {}).get("probe_epochs", 20))
+    model = build_pann().to(device)
+    model.set_branch_mask({n: (n in key) for n in model.branch_names})
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=cfg["learning_rate"],
+        weight_decay=cfg["weight_decay"],
+    )
+
+    train_loader = data["train_loader"]
+    for _ in range(probe_epochs):
+        model.train()
+        for batch in train_loader:
+            *xb, y = batch
+            xb = [t.to(device) for t in xb]
+            y = y.to(device)
+            optimizer.zero_grad()
+            loss = loss_fn(model(*xb), y)
+            loss.backward()
+            optimizer.step()
+
+    r2 = _mean_val_r2(model, data["val_loader"], device, n_levels, n_output_vars)
+    cache[key] = r2
+    return r2
+
+
+def _shapley_from_r2(branch_names, r2_of_subset):
+    """General dominance (Shapley R2) per branch from an R2(subset) callable.
+
+    phi_b = sum over subsets S of (branches \\ b) of
+            [|S|! (k-|S|-1)! / k!] * (R2(S u {b}) - R2(S))
+    The phi_b sum to R2(full set).  ``r2_of_subset`` takes a frozenset.
+    """
+    k = len(branch_names)
+    phi = {n: 0.0 for n in branch_names}
+    for n in branch_names:
+        others = [m for m in branch_names if m != n]
+        for s in range(len(others) + 1):
+            weight = factorial(s) * factorial(k - s - 1) / factorial(k)
+            for subset in itertools.combinations(others, s):
+                base = r2_of_subset(frozenset(subset))
+                with_n = r2_of_subset(frozenset(subset) | {n})
+                phi[n] += weight * (with_n - base)
+    return phi
+
+
+def _dominance_probe_weights(branch_names, build_pann, data, loss_fn, device,
+                             cfg, n_levels, n_output_vars):
+    """Fixed branch weights from a dominance-analysis probe (before training).
+
+    ``dominance_order``:
+      - ``single``: importance_b = R2 of the model with only branch b active
+        (k probes).
+      - ``full``  : importance_b = Shapley value over all 2^k-1 branch subsets
+        (general dominance).
+
+    Weights = clamp(importance, 0) normalised to sum to k (uniform fallback if
+    every importance is ~0).  Returns ``(weights_dict, log)``.
+    """
+    bd_cfg = cfg.get("branch_dropout") or {}
+    order = str(bd_cfg.get("dominance_order", "full"))
+    probe_epochs = int(bd_cfg.get("probe_epochs", 20))
+    k = len(branch_names)
+    cache = {}
+
+    def r2_of(subset):
+        return _subset_r2(subset, build_pann, data, loss_fn, device, cfg,
+                          n_levels, n_output_vars, cache)
+
+    print(f"\n  --- Dominance probe (order={order}, "
+          f"probe_epochs={probe_epochs}, branches={k}) ---")
+
+    if order == "single":
+        importance = {n: r2_of(frozenset([n])) for n in branch_names}
+    else:
+        n_subsets = 2 ** k - 1
+        print(f"    full dominance: training {n_subsets} branch subsets")
+        for s in range(1, k + 1):
+            for subset in itertools.combinations(branch_names, s):
+                r2_of(frozenset(subset))
+        importance = _shapley_from_r2(branch_names, r2_of)
+
+    skill = {n: max(importance[n], 0.0) for n in branch_names}
+    total = sum(skill.values())
+    if total < 1e-12:
+        weights = {n: 1.0 for n in branch_names}
+        print("    all importances ~0; falling back to uniform weights")
+    else:
+        weights = {n: skill[n] / total * k for n in branch_names}
+
+    log = {
+        "method": "dominance",
+        "order": order,
+        "probe_epochs": probe_epochs,
+        "importance": {n: float(importance[n]) for n in branch_names},
+        "weights": {n: float(weights[n]) for n in branch_names},
+    }
+    if order != "single":
+        log["full_model_r2"] = float(r2_of(frozenset(branch_names)))
+        log["subset_r2"] = {
+            ",".join(sorted(key)): float(v)
+            for key, v in cache.items() if key
+        }
+
+    for n in branch_names:
+        print(f"    {n:16s}  importance={importance[n]:+.6e}  "
+              f"weight={weights[n]:.4f}")
+    print()
+    return weights, log
+
+
 def train_one_fold(model, train_loader, val_loader, cfg, device, save_dir,
-                   level_weights=None):
+                   level_weights=None, fixed_weights=None, weight_log=None):
     model.to(device)
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -119,20 +290,20 @@ def train_one_fold(model, train_loader, val_loader, cfg, device, save_dir,
         weight_decay=cfg["weight_decay"],
     )
 
-    if level_weights is not None:
-        w = level_weights.to(device)
-        def loss_fn(pred, target):
-            return (w * (pred - target) ** 2).mean()
-    else:
-        _mse = torch.nn.MSELoss()
-        def loss_fn(pred, target):
-            return _mse(pred, target)
+    loss_fn = _make_loss_fn(level_weights, device)
 
-    # Shapley branch reweighting config
+    # Branch reweighting config
     bd_cfg = cfg.get("branch_dropout") or {}
+    method = str(bd_cfg.get("method", "variance"))
     warmup_epochs = int(bd_cfg.get("warmup_epochs", 0))
     reweight_interval = int(bd_cfg.get("reweight_interval", 5))
-    reweight_log = None
+    reweight_log = weight_log
+
+    # Dominance / explicit weights are fixed once, up front.
+    if fixed_weights is not None:
+        model.set_branch_weights(fixed_weights)
+    # Periodic variance reweighting only applies to the variance method.
+    use_variance_reweight = (method == "variance") and (fixed_weights is None)
 
     best_val_loss = float("inf")
     patience_counter = 0
@@ -159,7 +330,7 @@ def train_one_fold(model, train_loader, val_loader, cfg, device, save_dir,
         past_warmup = (epoch + 1) >= warmup_epochs and warmup_epochs > 0
         at_interval = ((epoch + 1 - warmup_epochs) % reweight_interval == 0
                        if past_warmup else False)
-        if past_warmup and at_interval:
+        if use_variance_reweight and past_warmup and at_interval:
             print(f"\n  --- Variance branch reweight after epoch {epoch + 1} ---")
             weights, reweight_log = _branch_variance_reweight(
                 model, val_loader, device,
@@ -192,6 +363,7 @@ def train_one_fold(model, train_loader, val_loader, cfg, device, save_dir,
                 "config": cfg,
                 "branch_mask": model.branch_mask.copy(),
                 "branch_weights": model.branch_weights.copy(),
+                "weight_method": method,
             }
             if reweight_log is not None:
                 checkpoint["reweight_log"] = reweight_log
@@ -301,6 +473,24 @@ def main():
         (n, raw["x_branch_list"][i].shape[1]) for i, n in enumerate(names)
     ]
 
+    def build_pann():
+        return PANN(
+            n_levels=raw["n_levels"],
+            hidden_dim=cfg["hidden_dim"],
+            branches=branches_spec,
+            architecture=cfg.get("architecture", "flat"),
+            n_hidden_layers=cfg.get("n_hidden_layers", 4),
+            bottleneck_dim=cfg.get("bottleneck_dim", 64),
+            dropout=cfg.get("dropout", 0.0),
+            n_output_vars=n_output_vars,
+            conv_channels=cfg.get("conv_channels"),
+        )
+
+    method = str((cfg.get("branch_dropout") or {}).get("method", "variance"))
+    # Dominance weights are probed once per block (on fold 0) and reused.
+    block_fixed_weights = None
+    block_weight_log = None
+
     t0 = time.time()
     for fold_i, (train_idx, val_idx) in enumerate(folds):
         print(f"\n{'='*60}")
@@ -313,25 +503,23 @@ def main():
 
         data = make_dataloaders(raw, train_idx, val_idx, cfg["batch_size"])
 
-        model = PANN(
-            n_levels=raw["n_levels"],
-            hidden_dim=cfg["hidden_dim"],
-            branches=branches_spec,
-            architecture=cfg.get("architecture", "flat"),
-            n_hidden_layers=cfg.get("n_hidden_layers", 4),
-            bottleneck_dim=cfg.get("bottleneck_dim", 64),
-            dropout=cfg.get("dropout", 0.0),
-            n_output_vars=n_output_vars,
-            conv_channels=cfg.get("conv_channels"),
-        )
+        model = build_pann()
         if fold_i == 0:
             n_params = sum(p.numel() for p in model.parameters())
             print(f"Model parameters: {n_params:,}")
+            if method == "dominance":
+                loss_fn = _make_loss_fn(level_weights, device)
+                block_fixed_weights, block_weight_log = _dominance_probe_weights(
+                    list(names), build_pann, data, loss_fn, device, cfg,
+                    raw["n_levels"], n_output_vars,
+                )
 
         history = train_one_fold(
             model, data["train_loader"], data["val_loader"],
             cfg, device, fold_dir,
             level_weights=level_weights,
+            fixed_weights=block_fixed_weights,
+            weight_log=block_weight_log,
         )
 
         save_branch_scalers(

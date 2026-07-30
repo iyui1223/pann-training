@@ -22,10 +22,20 @@ epochs: 39
 patience: 20
 weight_decay: 1.0e-5
 
-# Shapley branch reweighting: soft-weight branches by importance after warmup
+# Branch reweighting: soft-weight branches by importance.
+#   method "variance"  : periodic explained-variance reweight during training.
+#   method "dominance" : dominance-analysis probe BEFORE training fixes weights.
+#   method "none"      : no reweighting (all weights = 1).
 branch_dropout:
+  method: dominance       # variance | dominance | none
+  # --- dominance method ---
+  dominance_order: full   # "single" (R2 of each branch alone, k probes)
+                          # "full"   (Shapley over all 2^k-1 branch subsets)
+  probe_epochs: 20        # epochs to train each subset probe
+  
+  # --- variance method ---
   warmup_epochs: 10       # train normally for this many epochs first
-  reweight_interval: 15    # recompute Shapley weights every N epochs after warmup
+  reweight_interval: 15   # recompute weights every N epochs after warmup
 
 # Data
 n_folds: 4

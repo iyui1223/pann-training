@@ -17,6 +17,12 @@ xarray     = ">=2024.1"
 netCDF4    = "*"
 matplotlib = ">=3.8"
 
+[tool.poetry.group.dominance.dependencies]
+# Optional: only needed for experiments/dominance_synthetic_test.py.
+# Pulls heavy/pinned deps (bokeh==2.4.3, cufflinks, plotly, statsmodels);
+# install into a throwaway env rather than the main training venv.
+dominance-analysis = ">=1.1.9"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
