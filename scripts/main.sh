@@ -63,28 +63,32 @@ if [[ "${N_BLOCKS}" -gt 0 ]]; then
     echo "Level-blocking mode: ${N_BLOCKS} blocks"
     echo ""
 
-    TRAIN_JOBS=""
-    for B in $(seq 0 $((N_BLOCKS - 1))); do
-        JOB=$(sbatch \
-            --account="${SLURM_ACCOUNT}" \
-            --partition="${SLURM_PARTITION}" \
-            --time="${SLURM_TIME_TRAIN}" \
-            --export=ALL,BLOCK_IDX=${B} \
-            "${SCRIPT_DIR}/step1_train.sh" \
-            | awk '{print $4}')
-        echo "  Block ${B} train: job ${JOB}"
-        TRAIN_JOBS="${TRAIN_JOBS}:${JOB}"
-    done
+    # One job array instead of N independent jobs.  The %N suffix caps how
+    # many tasks run concurrently, which keeps simultaneous cold imports off
+    # the shared filesystem and lets a bad batch be cancelled after the first
+    # wave rather than after all blocks have burned credit.
+    JOB_TRAIN=$(sbatch \
+        --account="${SLURM_ACCOUNT}" \
+        --partition="${SLURM_PARTITION}" \
+        --time="${SLURM_TIME_TRAIN}" \
+        --array="0-$((N_BLOCKS - 1))%${SLURM_ARRAY_THROTTLE}" \
+        --output="logs/train_%A_%a.out" \
+        --error="logs/train_%A_%a.err" \
+        "${SCRIPT_DIR}/step1_train.sh" \
+        | awk '{print $4}')
+    echo "  Train array: job ${JOB_TRAIN}  (${N_BLOCKS} blocks, max ${SLURM_ARRAY_THROTTLE} concurrent)"
 
     JOB_EVAL=$(sbatch \
         --account="${SLURM_ACCOUNT}" \
         --partition="${SLURM_PARTITION}" \
         --time="${SLURM_TIME_EVAL}" \
-        --dependency=afterok${TRAIN_JOBS} \
+        --dependency=afterok:${JOB_TRAIN} \
         "${SCRIPT_DIR}/step2_evaluate.sh" \
         | awk '{print $4}')
     echo ""
     echo "  Evaluate: job ${JOB_EVAL}  (after all blocks)"
+    echo ""
+    echo "  Cancel everything with:  scancel ${JOB_TRAIN} ${JOB_EVAL}"
 
 else
     echo "Standard (non-blocked) mode"

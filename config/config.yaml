@@ -51,6 +51,10 @@ target:
     cloud_scale: 0.9
     cloud_center_hpa: 500
     cloud_sigma_levels: 5
+    # Zig-zag: cosine ripple on the cloud Gaussian hull.  amp 0 = plain
+    # Gaussian; amp >1 makes the envelope alternate in sign.
+    cloud_ripple_amp: 0.6
+    cloud_ripple_period_levels: 6
 
 # Loss weighting: "pressure" = p/p_sfc per level; "uniform" = plain MSE
 level_weight: pressure
