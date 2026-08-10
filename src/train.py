@@ -223,6 +223,12 @@ def _dominance_probe_weights(branch_names, build_pann, data, loss_fn, device,
     ``dominance_order``:
       - ``single``: importance_b = R2 of the model with only branch b active
         (k probes).
+      - ``loco``  : importance_b = R2(all) - R2(all \\ b), i.e. leave-one-
+        covariate-out (Lei et al. 2018, JASA; Verdinelli & Wasserman 2024,
+        Statist. Sci.).  k+1 probes.  Unlike Shapley, gives ~0 weight to a
+        branch that merely correlates with a true predictor; caveat: a pair
+        of branches that are redundant with EACH OTHER both get ~0 (see
+        experiments/correlated_nonpredictor_shapley.py, scenario B).
       - ``full``  : importance_b = Shapley value over all 2^k-1 branch subsets
         (general dominance).
 
@@ -230,7 +236,7 @@ def _dominance_probe_weights(branch_names, build_pann, data, loss_fn, device,
     every importance is ~0).  Returns ``(weights_dict, log)``.
     """
     bd_cfg = cfg.get("branch_dropout") or {}
-    order = str(bd_cfg.get("dominance_order", "full"))
+    order = str(bd_cfg.get("dominance_order", "loco"))
     probe_epochs = int(bd_cfg.get("probe_epochs", 20))
     k = len(branch_names)
     cache = {}
@@ -244,6 +250,11 @@ def _dominance_probe_weights(branch_names, build_pann, data, loss_fn, device,
 
     if order == "single":
         importance = {n: r2_of(frozenset([n])) for n in branch_names}
+    elif order == "loco":
+        print(f"    LOCO: training full model + {k} drop-one models")
+        full = frozenset(branch_names)
+        r2_full = r2_of(full)
+        importance = {n: r2_full - r2_of(full - {n}) for n in branch_names}
     else:
         n_subsets = 2 ** k - 1
         print(f"    full dominance: training {n_subsets} branch subsets")

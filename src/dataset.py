@@ -51,8 +51,22 @@ BRANCH_LABELS = {
     "nogw": "Non-orographic GWD",
 }
 
+# Compact forms for legends on small (publication-sized) figures.
+BRANCH_LABELS_SHORT = {
+    "conv": "Convection",
+    "cloud": "Cloud",
+    "rad_sw": "SW",
+    "rad_sw_clear": "SW clear",
+    "rad_lw": "LW",
+    "rad_lw_clear": "LW clear",
+    "vdif": "VDF+GWD",
+    "nogw": "NOGW",
+}
 
-def branch_label(name):
+
+def branch_label(name, short=False):
+    if short and name in BRANCH_LABELS_SHORT:
+        return BRANCH_LABELS_SHORT[name]
     return BRANCH_LABELS.get(name, name)
 
 
@@ -283,15 +297,38 @@ def load_raw_arrays(nc_path, n_levels=None, level_start=None, target_cfg=None,
             k = np.arange(n_lev)
             return np.exp(-0.5 * ((k - k_center) / sigma_levels) ** 2)
 
+        def _zigzag_envelope(center_hpa, sigma_levels, ripple_amp,
+                             ripple_period_levels):
+            """Gaussian hull modulated by a cosine ripple in level space.
+
+            The ripple is phase-locked to the centre and normalised by
+            ``1 + ripple_amp``, so the envelope is still exactly 1 at
+            ``center_hpa`` and the hull keeps the original vertical extent.
+            ``ripple_amp > 1`` makes the envelope alternate in sign.
+            """
+            k_center = int(np.argmin(np.abs(p_hpa - center_hpa)))
+            k = np.arange(n_lev)
+            hull = np.exp(-0.5 * ((k - k_center) / sigma_levels) ** 2)
+            ripple = 1.0 + ripple_amp * np.cos(
+                2.0 * np.pi * (k - k_center) / ripple_period_levels
+            )
+            return hull * ripple / (1.0 + ripple_amp)
+
         conv_scale = float(sub.get("conv_scale", 1.1))
         conv_center = float(sub.get("conv_center_hpa", 200))
         conv_sigma = float(sub.get("conv_sigma_levels", 2))
         cloud_scale = float(sub.get("cloud_scale", 0.9))
         cloud_center = float(sub.get("cloud_center_hpa", 500))
         cloud_sigma = float(sub.get("cloud_sigma_levels", 5))
+        cloud_ripple_amp = float(sub.get("cloud_ripple_amp", 0.0))
+        cloud_ripple_period = float(sub.get("cloud_ripple_period_levels", 6))
 
         env_conv = _gaussian_envelope(conv_center, conv_sigma)
-        env_cloud = _gaussian_envelope(cloud_center, cloud_sigma)
+        if cloud_ripple_amp > 0.0:
+            env_cloud = _zigzag_envelope(cloud_center, cloud_sigma,
+                                         cloud_ripple_amp, cloud_ripple_period)
+        else:
+            env_cloud = _gaussian_envelope(cloud_center, cloud_sigma)
 
         y = (conv_scale * env_conv[None, :] * x_conv_q
              + cloud_scale * env_cloud[None, :] * x_cloud_q)

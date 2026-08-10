@@ -29,9 +29,14 @@ weight_decay: 1.0e-5
 branch_dropout:
   method: dominance       # variance | dominance | none
   # --- dominance method ---
-  dominance_order: full   # "single" (R2 of each branch alone, k probes)
+  dominance_order: loco   # "single" (R2 of each branch alone, k probes)
+                          # "loco"   (leave-one-out: R2(all) - R2(all\b),
+                          #           k+1 probes; suppresses branches that
+                          #           merely correlate with true predictors,
+                          #           unlike "full" Shapley -- see
+                          #           experiments/correlated_nonpredictor_shapley.py)
                           # "full"   (Shapley over all 2^k-1 branch subsets)
-  probe_epochs: 20        # epochs to train each subset probe
+  probe_epochs: 30        # epochs to train each subset probe
   
   # --- variance method ---
   warmup_epochs: 10       # train normally for this many epochs first
@@ -46,8 +51,8 @@ target:
   mode: simple_gaussian_q
   simple_gaussian_q:
     conv_scale: 1.1
-    conv_center_hpa: 250     # lowered from 150 hPa (safer from stratospheric noise)
-    conv_sigma_levels: 3
+    conv_center_hpa: 300  
+    conv_sigma_levels: 4
     cloud_scale: 0.9
     cloud_center_hpa: 500
     cloud_sigma_levels: 5
