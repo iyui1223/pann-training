@@ -58,26 +58,61 @@ def _predict(model, loader, device):
     return np.concatenate(preds), np.concatenate(targets)
 
 
-def _predict_branches(model, loader, device):
-    """Return per-branch outputs in normalised space, weighted by branch_weights.
+def _predict_branches(model, loader, device, scalers):
+    """Return anchored per-branch outputs and the intercept, normalised space.
 
-    The model's forward pass stores raw (unweighted) branch outputs in
-    ``branch_outputs``.  We multiply by the branch weight here so that
-    downstream analysis (Shapley profiles, contribution plots) reflects
-    each branch's actual contribution to the final prediction.
+    Each branch is anchored at its "process off" input ``x_off`` (the
+    normalised image of a physically zero input)::
+
+        f_b(x) = w_b * (NN_b(x) - NN_b(x_off))
+        intercept = sum_b w_b * NN_b(x_off)
+
+    This is an exact rewrite of the model (``sum_b f_b + intercept`` equals
+    the prediction), but it pins down the branch constants, which the loss
+    alone leaves free: only their sum is identifiable.  So ``E[f_b]`` becomes
+    a meaningful mean contribution, and ``f_b = 0`` whenever process ``b`` is
+    off.  Dropped branches (``branch_mask`` False) contribute zero.
     """
     model.eval()
+    n_out = model.n_output_vars * model.n_levels
     branch_preds = {n: [] for n in model.branch_names}
+    intercept = np.zeros(n_out)
     with torch.no_grad():
+        offsets = {}
+        for name in model.branch_names:
+            if not model.branch_mask.get(name, True):
+                continue
+            n_in = scalers[name].mean.shape[0]
+            x_off = torch.as_tensor(
+                scalers[name].transform(np.zeros((1, n_in))),
+                dtype=torch.float32, device=device,
+            )
+            w = model.branch_weights.get(name, 1.0)
+            offsets[name] = model.branches[name](x_off)
+            intercept += w * offsets[name][0].cpu().numpy()
+
         for batch in loader:
             *xb, y = batch
             xb = [t.to(device) for t in xb]
-            _, branches = model(*xb, save_hidden=True)
-            for name in model.branch_names:
+            for name, x in zip(model.branch_names, xb):
+                if name not in offsets:
+                    branch_preds[name].append(np.zeros((x.size(0), n_out)))
+                    continue
                 w = model.branch_weights.get(name, 1.0)
-                branch_preds[name].append(
-                    (w * branches[name][0]).cpu().numpy())
-    return {n: np.concatenate(v) for n, v in branch_preds.items()}
+                f = w * (model.branches[name](x) - offsets[name])
+                branch_preds[name].append(f.cpu().numpy())
+    return {n: np.concatenate(v) for n, v in branch_preds.items()}, intercept
+
+
+def _branches_to_physical(branch_n, intercept_n, scaler_y):
+    """Anchored branch outputs and intercept to physical units.
+
+    Branches are scaled only; the target mean ``y_mean`` belongs to the
+    unattributed intercept, so ``intercept + sum_b f_b`` is the prediction.
+    """
+    branch_phys = {n: v * scaler_y.std for n, v in branch_n.items()}
+    intercept_phys = intercept_n * scaler_y.std + scaler_y.mean
+    return branch_phys, intercept_phys
 
 
 def _build_model(cfg, n_levels):
@@ -223,6 +258,7 @@ def _evaluate_one_block(block_dir, raw_full, cfg_main, device, block_idx,
     all_pred_phys = []
     all_target_phys = []
     all_branch_phys = {n: [] for n in branch_names}
+    all_intercept_phys = []
 
     for fold_i, (train_idx, val_idx) in enumerate(folds):
         fold_dir = block_dir / f"fold_{fold_i}"
@@ -243,17 +279,22 @@ def _evaluate_one_block(block_dir, raw_full, cfg_main, device, block_idx,
         all_target_phys.append(scalers["y"].inverse_transform(target_n))
         all_val_idx.append(val_idx)
 
-        bp_n = _predict_branches(model, data["val_loader"], device)
+        bp_n, icpt_n = _predict_branches(model, data["val_loader"], device,
+                                         scalers)
+        branch_phys_f, icpt_phys = _branches_to_physical(bp_n, icpt_n,
+                                                         scalers["y"])
         for name in branch_names:
-            all_branch_phys[name].append(
-                scalers["y"].inverse_transform(bp_n[name]))
+            all_branch_phys[name].append(branch_phys_f[name])
+        all_intercept_phys.append(
+            np.broadcast_to(icpt_phys, (len(val_idx), icpt_phys.size)))
 
     pred_phys = np.concatenate(all_pred_phys)
     target_phys = np.concatenate(all_target_phys)
     val_idx_all = np.concatenate(all_val_idx)
     branch_phys = {n: np.concatenate(v) for n, v in all_branch_phys.items()}
+    intercept_phys = np.concatenate(all_intercept_phys)
 
-    return pred_phys, target_phys, val_idx_all, branch_phys
+    return pred_phys, target_phys, val_idx_all, branch_phys, intercept_phys
 
 
 # ── Attribution figure style ────────────────────────────────────────────────
@@ -451,13 +492,14 @@ def plot_branch_contributions(branch_means, branch_names, n_levels, fig_dir,
                               n_output_vars=2, pressure_pa=None,
                               var_labels=("T bias", "Q bias"),
                               target_mean=None, pred_mean=None,
-                              branch_weights=None):
+                              branch_weights=None, intercept_mean=None):
     """Mean predicted bias contribution per branch (physical units).
 
     When ``branch_weights`` is provided, each branch profile is scaled by
     its weight so the plotted profiles reflect the actual model output.
     ``pred_mean`` (the actual weighted prediction mean) is used for the
-    sum line when available.
+    sum line when available.  ``intercept_mean`` is the unattributed
+    intercept of the anchored decomposition (prediction = intercept + sum).
     """
     yvals, ylabel = _y_axis(pressure_pa, n_levels)
     fig, axes = plt.subplots(1, len(var_labels), figsize=(6 * len(var_labels), 7))
@@ -486,6 +528,12 @@ def plot_branch_contributions(branch_means, branch_names, n_levels, fig_dir,
                 linewidth=1.1,
             )
             total = weighted if total is None else total + weighted
+
+        if intercept_mean is not None:
+            icpt = intercept_mean.reshape(n_output_vars, n_levels)[i]
+            ax.plot(icpt, yvals, color="0.4", linestyle=":", linewidth=1.4,
+                    label="Intercept (unattributed)")
+            total = total + icpt
 
         if pred_mean is not None:
             sum_profile = pred_mean.reshape(n_output_vars, n_levels)[i]
@@ -1112,12 +1160,13 @@ def main():
         block_pred_list = []
         block_target_list = []
         block_branch_lists = {n: [] for n in branch_names}
+        block_intercept_list = []
         val_idx_all = None
 
         for b_idx in block_indices:
             block_dir = model_dir / f"block_{b_idx}"
             print(f"\nBlock {b_idx}: {block_dir}")
-            pred_b, tgt_b, vidx_b, bp_b = _evaluate_one_block(
+            pred_b, tgt_b, vidx_b, bp_b, icpt_b = _evaluate_one_block(
                 block_dir, raw, cfg, device,
                 b_idx, block_size, block_overlap,
             )
@@ -1125,6 +1174,7 @@ def main():
             block_target_list.append(tgt_b)
             for n in branch_names:
                 block_branch_lists[n].append(bp_b[n])
+            block_intercept_list.append(icpt_b)
             if val_idx_all is None:
                 val_idx_all = vidx_b
 
@@ -1136,6 +1186,8 @@ def main():
         for n in branch_names:
             branch_phys[n] = _stitch_blocks(
                 block_branch_lists[n], blocks, blend_weights, n_levels, n_out)
+        intercept_phys = _stitch_blocks(block_intercept_list, blocks,
+                                        blend_weights, n_levels, n_out)
 
     else:
         folds = kfold_indices(raw["n_samples"], n_folds,
@@ -1145,6 +1197,7 @@ def main():
         all_pred_phys = []
         all_target_phys = []
         all_branch_phys = {n: [] for n in branch_names}
+        all_intercept_phys = []
 
         for fold_i, (train_idx, val_idx) in enumerate(folds):
             if fold_i >= n_folds:
@@ -1164,15 +1217,20 @@ def main():
             all_target_phys.append(scalers["y"].inverse_transform(target_n))
             all_val_idx.append(val_idx)
 
-            bp_n = _predict_branches(model, data["val_loader"], device)
+            bp_n, icpt_n = _predict_branches(model, data["val_loader"], device,
+                                             scalers)
+            branch_phys_f, icpt_phys = _branches_to_physical(bp_n, icpt_n,
+                                                             scalers["y"])
             for name in branch_names:
-                all_branch_phys[name].append(
-                    scalers["y"].inverse_transform(bp_n[name]))
+                all_branch_phys[name].append(branch_phys_f[name])
+            all_intercept_phys.append(
+                np.broadcast_to(icpt_phys, (len(val_idx), icpt_phys.size)))
 
         pred_phys = np.concatenate(all_pred_phys)
         target_phys = np.concatenate(all_target_phys)
         val_idx_all = np.concatenate(all_val_idx)
         branch_phys = {n: np.concatenate(v) for n, v in all_branch_phys.items()}
+        intercept_phys = np.concatenate(all_intercept_phys)
         blocks = None
 
     # ── Metrics ──────────────────────────────────────────────────────────
@@ -1200,12 +1258,15 @@ def main():
     target_mean_phys = target_phys.mean(axis=0)
     pred_mean_phys = pred_phys.mean(axis=0)
 
+    intercept_mean_phys = intercept_phys.mean(axis=0)
+
     # branch_phys is already weighted by branch_weights (applied in
     # _predict_branches), so no extra weight scaling is needed here.
     plot_branch_contributions(
         branch_means_phys, branch_names, n_levels, fig_dir,
         n_output_vars=n_out, pressure_pa=pressure_pa, var_labels=var_labels,
         target_mean=target_mean_phys, pred_mean=pred_mean_phys,
+        intercept_mean=intercept_mean_phys,
     )
 
     if target_mode in _SYNTHETIC_MODES:
@@ -1265,6 +1326,7 @@ def main():
         val_idx=val_idx_all,
         pred_phys=pred_phys,
         target_phys=target_phys,
+        intercept_mean=intercept_mean_phys,
     )
     for n in branch_names:
         metrics_kw[f"branch_mean_{n}"] = branch_means_phys[n]
