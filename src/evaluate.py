@@ -339,11 +339,27 @@ def _decade_suffix(exponent):
     return rf" [$10^{{{exponent}}}$]" if exponent else ""
 
 
-def _profile_axes(ax, yvals):
-    """Common dressing for the vertical-profile attribution panels."""
+def _profile_axes(ax, yvals, title=None, grid_over_fill=False):
+    """Common dressing for the vertical-profile attribution panels.
+
+    ``grid_over_fill`` lifts the gridlines above filled areas — matplotlib
+    puts them at zorder 2.5 once the axis is no longer "below", which is
+    over the fills but still under the profile lines — and lightens them so
+    they read against the stacked colours.
+    """
     ax.set_ylim(np.max(yvals), np.min(yvals))
-    ax.grid(alpha=0.25, linewidth=0.5)
-    ax.xaxis.set_major_locator(plt.MaxNLocator(4))
+    if grid_over_fill:
+        ax.set_axisbelow(False)
+        ax.grid(color="white", alpha=0.6, linewidth=0.6)
+    else:
+        ax.grid(alpha=0.25, linewidth=0.5)
+    if title:
+        ax.set_title(title)
+
+
+def _sum_legend_handle():
+    return Line2D([], [], color=SOURCE_GREY[_SATURATED],
+                  linestyle=_SUM_LINESTYLE, linewidth=2.0, label="Sum")
 
 
 def _save_attribution_figure(fig, fig_dir, out_stem, vlabel, var_labels):
@@ -538,76 +554,124 @@ def compute_truth_branch_phys(raw, branch_names, val_idx_all):
     return out
 
 
+# Each ``_draw_*`` routine dresses one panel, so the same three panels can be
+# composed either as two small figures or as a single three-panel row.
+# ``sources`` maps a source key ("truth", "pred") to an ``Attribution``; every
+# source present is drawn in the same axes, so the planted truth and the model
+# attribution are compared without a second figure.
+
+
+def _draw_absolute_importance(ax, sources, branch_names, yvals, var_idx,
+                              vlabel, title=None):
+    """Mean |Shapley| per branch, in units of a factored-out power of ten."""
+    exponent = _decade([attr.shapley[n][var_idx] for attr in sources.values()
+                        for n in branch_names])
+    for src, attr in sources.items():
+        style = SOURCE_STYLE[src]
+        for j, name in enumerate(branch_names):
+            ax.plot(
+                attr.shapley[name][var_idx] / 10.0 ** exponent, yvals,
+                color=branch_shade(name, j, style["shade"]),
+                linewidth=style["linewidth"], alpha=style["alpha"],
+                zorder=style["zorder"],
+            )
+    ax.set_xlabel(rf"Mean $|\phi - b |$, Q error variance {_decade_suffix(exponent)}")
+    ax.set_xlim(left=0)
+    ax.xaxis.set_major_locator(plt.MaxNLocator(4))
+    _profile_axes(ax, yvals, title)
+
+
+def _draw_relative_importance(ax, sources, branch_names, yvals, n_levels,
+                              var_idx, title=None):
+    """Fractional importance: stacked area for the reference source, with the
+    remaining sources overdrawn as cumulative boundary lines."""
+    fill_src = "truth" if "truth" in sources else next(iter(sources))
+
+    fracs = _shapley_fractions(sources[fill_src].shapley, branch_names, var_idx)
+    cumulative = np.zeros(n_levels)
+    for j, name in enumerate(branch_names):
+        ax.fill_betweenx(
+            yvals, cumulative, cumulative + fracs[j],
+            color=branch_shade(name, j, _PALE),
+            alpha=0.9, zorder=1, linewidth=0,
+        )
+        cumulative = cumulative + fracs[j]
+
+    # Interior boundaries only: the outer edges are 0 and 1 by construction.
+    for src in (s for s in sources if s != fill_src):
+        style = SOURCE_STYLE[src]
+        fracs = _shapley_fractions(sources[src].shapley, branch_names, var_idx)
+        cumulative = np.zeros(n_levels)
+        for j, name in enumerate(branch_names[:-1]):
+            cumulative = cumulative + fracs[j]
+            ax.plot(
+                cumulative, yvals,
+                color=branch_shade(name, j, style["shade"]),
+                linewidth=style["linewidth"], alpha=style["alpha"],
+                zorder=style["zorder"],
+            )
+
+    ax.set_xlabel(r"Fraction of total $|\phi - b |$")
+    ax.set_xlim(0, 1)
+    ax.set_xticks([0, 0.5, 1])
+    _profile_axes(ax, yvals, title, grid_over_fill=True)
+
+
+def _draw_weighted_contributions(ax, sources, branch_names, yvals, n_levels,
+                                 var_idx, n_output_vars, vlabel, title=None):
+    """Mean contribution per branch scaled by its Shapley fraction.
+
+    At each level the raw mean contribution is scaled by the fraction of
+    total mean-|Shapley| attributed to that branch, so visually
+    less-important branches are attenuated.
+    """
+    weighted = {}
+    for src, attr in sources.items():
+        fracs = _shapley_fractions(attr.shapley, branch_names, var_idx)
+        weighted[src] = [
+            attr.means[n].reshape(n_output_vars, n_levels)[var_idx] * fracs[j]
+            for j, n in enumerate(branch_names)
+        ]
+    exponent = _decade(list(weighted.values()))
+
+    for src, profiles in weighted.items():
+        style = SOURCE_STYLE[src]
+        for j, (name, profile) in enumerate(zip(branch_names, profiles)):
+            ax.plot(
+                profile / 10.0 ** exponent, yvals,
+                color=branch_shade(name, j, style["shade"]),
+                linewidth=style["linewidth"], alpha=style["alpha"],
+                zorder=style["zorder"],
+            )
+        ax.plot(
+            np.sum(profiles, axis=0) / 10.0 ** exponent, yvals,
+            color=SOURCE_GREY[style["shade"]], linestyle=_SUM_LINESTYLE,
+            linewidth=style["linewidth"], alpha=style["alpha"],
+            zorder=style["zorder"] + 2,
+        )
+
+    ax.axvline(0, color="k", linewidth=0.5, alpha=0.3)
+    ax.set_xlabel(f"Mean b, {vlabel}{_decade_suffix(exponent)}")
+    ax.xaxis.set_major_locator(plt.MaxNLocator(4))
+    _profile_axes(ax, yvals, title)
+
+
 def plot_branch_shapley_profiles(sources, branch_names, n_levels, fig_dir,
                                  pressure_pa=None, var_labels=("Q bias",),
                                  out_stem="branch_shapley_profiles"):
-    """Vertical profile of mean |Shapley| per branch (importance decomposition).
-
-    ``sources`` maps a source key ("truth", "pred") to an ``Attribution``;
-    every source present is drawn in the same axes so that planted truth
-    and model attribution can be compared without a second figure.
-
-    Left panel: absolute importance per branch.
-    Right panel: fractional importance, filled for the reference source and
-    overdrawn as cumulative boundary lines for the remaining ones.
-    """
+    """Branch importance decomposition: absolute and relative panels."""
     yvals, ylabel = _y_axis(pressure_pa, n_levels)
-    fill_src = "truth" if "truth" in sources else next(iter(sources))
-    line_srcs = [s for s in sources if s != fill_src]
 
     for i, vlabel in enumerate(var_labels):
         fig, (ax_abs, ax_frac) = plt.subplots(
             1, 2, figsize=(6.4, 3.6), sharey=True,
         )
-
-        exponent = _decade([attr.shapley[n][i] for attr in sources.values()
-                            for n in branch_names])
-        for src, attr in sources.items():
-            style = SOURCE_STYLE[src]
-            for j, name in enumerate(branch_names):
-                ax_abs.plot(
-                    attr.shapley[name][i] / 10.0 ** exponent, yvals,
-                    color=branch_shade(name, j, style["shade"]),
-                    linewidth=style["linewidth"], alpha=style["alpha"],
-                    zorder=style["zorder"],
-                )
-
-        ax_abs.set_xlabel(rf"Mean $|\phi|$, {vlabel}{_decade_suffix(exponent)}")
+        _draw_absolute_importance(ax_abs, sources, branch_names, yvals, i,
+                                  vlabel, "(a) Absolute importance")
         ax_abs.set_ylabel(ylabel)
-        ax_abs.set_title("(a) Absolute importance")
-        ax_abs.set_xlim(left=0)
-        _profile_axes(ax_abs, yvals)
         _attribution_legend(ax_abs, branch_names, sources)
-
-        fracs = _shapley_fractions(sources[fill_src].shapley, branch_names, i)
-        cumulative = np.zeros(n_levels)
-        for j, name in enumerate(branch_names):
-            ax_frac.fill_betweenx(
-                yvals, cumulative, cumulative + fracs[j],
-                color=branch_shade(name, j, _PALE),
-                alpha=0.9, zorder=1, linewidth=0,
-            )
-            cumulative = cumulative + fracs[j]
-
-        # Interior boundaries only: the outer edges are 0 and 1 by construction.
-        for src in line_srcs:
-            style = SOURCE_STYLE[src]
-            fracs = _shapley_fractions(sources[src].shapley, branch_names, i)
-            cumulative = np.zeros(n_levels)
-            for j, name in enumerate(branch_names[:-1]):
-                cumulative = cumulative + fracs[j]
-                ax_frac.plot(
-                    cumulative, yvals,
-                    color=branch_shade(name, j, style["shade"]),
-                    linewidth=style["linewidth"], alpha=style["alpha"],
-                    zorder=style["zorder"],
-                )
-
-        ax_frac.set_xlabel(r"Fraction of total $|\phi|$")
-        ax_frac.set_xlim(0, 1)
-        ax_frac.set_xticks([0, 0.5, 1])
-        ax_frac.set_title("(b) Relative importance")
-        ax_frac.set_ylim(np.max(yvals), np.min(yvals))
+        _draw_relative_importance(ax_frac, sources, branch_names, yvals,
+                                  n_levels, i, "(b) Relative importance")
 
         fig.tight_layout()
         _save_attribution_figure(fig, fig_dir, out_stem, vlabel, var_labels)
@@ -615,56 +679,49 @@ def plot_branch_shapley_profiles(sources, branch_names, n_levels, fig_dir,
 
 def plot_branch_contributions_weighted(sources, branch_names, n_levels, fig_dir,
                                        n_output_vars=1, pressure_pa=None,
-                                       var_labels=("Q bias",),
+                                       var_labels=("Q error variance",),
                                        out_stem="branch_contributions_shapley"):
-    """Branch contributions weighted by Shapley fractional importance.
-
-    At each level the raw mean contribution is scaled by the fraction of
-    total mean-|Shapley| attributed to that branch, so visually
-    less-important branches are attenuated.  As in
-    ``plot_branch_shapley_profiles``, every source in ``sources`` shares
-    one set of axes.
-    """
+    """Branch contributions weighted by Shapley fractional importance."""
     yvals, ylabel = _y_axis(pressure_pa, n_levels)
 
     for i, vlabel in enumerate(var_labels):
         fig, ax = plt.subplots(figsize=(3.7, 4.4))
-
-        weighted = {}
-        for src, attr in sources.items():
-            fracs = _shapley_fractions(attr.shapley, branch_names, i)
-            weighted[src] = [
-                attr.means[n].reshape(n_output_vars, n_levels)[i] * fracs[j]
-                for j, n in enumerate(branch_names)
-            ]
-        exponent = _decade(list(weighted.values()))
-
-        for src, profiles in weighted.items():
-            style = SOURCE_STYLE[src]
-            for j, (name, profile) in enumerate(zip(branch_names, profiles)):
-                ax.plot(
-                    profile / 10.0 ** exponent, yvals,
-                    color=branch_shade(name, j, style["shade"]),
-                    linewidth=style["linewidth"], alpha=style["alpha"],
-                    zorder=style["zorder"],
-                )
-            ax.plot(
-                np.sum(profiles, axis=0) / 10.0 ** exponent, yvals,
-                color=SOURCE_GREY[style["shade"]], linestyle=_SUM_LINESTYLE,
-                linewidth=style["linewidth"], alpha=style["alpha"],
-                zorder=style["zorder"] + 2,
-            )
-
-        ax.axvline(0, color="k", linewidth=0.5, alpha=0.3)
+        _draw_weighted_contributions(ax, sources, branch_names, yvals,
+                                     n_levels, i, n_output_vars, vlabel)
         ax.set_ylabel(ylabel)
-        ax.set_xlabel(f"Weighted mean {vlabel}{_decade_suffix(exponent)}")
-        _profile_axes(ax, yvals)
-        _attribution_legend(
-            ax, branch_names, sources,
-            extra_handles=[Line2D([], [], color=SOURCE_GREY[_SATURATED],
-                                  linestyle=_SUM_LINESTYLE, linewidth=2.0,
-                                  label="Sum")],
+        _attribution_legend(ax, branch_names, sources,
+                            extra_handles=[_sum_legend_handle()])
+
+        fig.tight_layout()
+        _save_attribution_figure(fig, fig_dir, out_stem, vlabel, var_labels)
+
+
+def plot_branch_attribution_summary(sources, branch_names, n_levels, fig_dir,
+                                    n_output_vars=1, pressure_pa=None,
+                                    var_labels=("Q bias",),
+                                    out_stem="branch_attribution_summary"):
+    """All three attribution panels in one row, sharing the pressure axis.
+
+    Same content as ``plot_branch_shapley_profiles`` (panels a, b) and
+    ``plot_branch_contributions_weighted`` (panel c), for use where a single
+    figure is preferable to two.
+    """
+    yvals, ylabel = _y_axis(pressure_pa, n_levels)
+
+    for i, vlabel in enumerate(var_labels):
+        fig, (ax_abs, ax_frac, ax_contrib) = plt.subplots(
+            1, 3, figsize=(9.4, 3.8), sharey=True,
         )
+        _draw_absolute_importance(ax_abs, sources, branch_names, yvals, i,
+                                  vlabel, "(a) Error variance")
+        ax_abs.set_ylabel(ylabel)
+        _attribution_legend(ax_abs, branch_names, sources,
+                            extra_handles=[_sum_legend_handle()])
+        _draw_relative_importance(ax_frac, sources, branch_names, yvals,
+                                  n_levels, i, "(b) Variance relative importance")
+        _draw_weighted_contributions(ax_contrib, sources, branch_names, yvals,
+                                     n_levels, i, n_output_vars, vlabel,
+                                     "(c) Mean error (bias)")
 
         fig.tight_layout()
         _save_attribution_figure(fig, fig_dir, out_stem, vlabel, var_labels)
@@ -1193,6 +1250,10 @@ def main():
             pressure_pa=pressure_pa, var_labels=var_labels,
         )
         plot_branch_contributions_weighted(
+            sources, branch_names, n_levels, fig_dir,
+            n_output_vars=n_out, pressure_pa=pressure_pa, var_labels=var_labels,
+        )
+        plot_branch_attribution_summary(
             sources, branch_names, n_levels, fig_dir,
             n_output_vars=n_out, pressure_pa=pressure_pa, var_labels=var_labels,
         )

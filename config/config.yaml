@@ -51,7 +51,7 @@ target:
   mode: simple_gaussian_q
   simple_gaussian_q:
     conv_scale: 1.1
-    conv_center_hpa: 300  
+    conv_center_hpa: 400  
     conv_sigma_levels: 4
     cloud_scale: 0.9
     cloud_center_hpa: 500
